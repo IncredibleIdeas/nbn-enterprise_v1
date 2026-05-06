@@ -375,17 +375,27 @@ def init_database():
 
         # Permissions
         permissions = [
+            # Admin — full access
             ('admin', 'view_dashboard'), ('admin', 'manage_products'), ('admin', 'manage_inventory'),
-            ('admin', 'manage_customers'), ('admin', 'manage_orders'), ('admin', 'manage_production'),
+            ('admin', 'manage_customers'), ('admin', 'manage_orders'),
             ('admin', 'manage_financials'), ('admin', 'view_reports'), ('admin', 'manage_users'),
             ('admin', 'manage_settings'), ('admin', 'view_activity_logs'),
+            # Manager — all except admin creation and system settings
             ('manager', 'view_dashboard'), ('manager', 'manage_products'), ('manager', 'manage_inventory'),
-            ('manager', 'manage_customers'), ('manager', 'manage_orders'), ('manager', 'manage_production'),
-            ('manager', 'view_reports'),
-            ('financial', 'view_dashboard'), ('financial', 'manage_financials'), ('financial', 'view_reports'),
-            ('financial', 'manage_orders'),
-            ('production', 'view_dashboard'), ('production', 'manage_production'), ('production', 'view_reports'),
-            ('sales', 'view_dashboard'), ('sales', 'manage_customers'), ('sales', 'manage_orders'),
+            ('manager', 'manage_customers'), ('manager', 'manage_orders'),
+            ('manager', 'manage_financials'), ('manager', 'view_reports'), ('manager', 'manage_users'),
+            # Finance Officer — finance dashboard, orders (view), reports; no inventory/products/user mgmt
+            ('finance_officer', 'view_dashboard'), ('finance_officer', 'manage_financials'),
+            ('finance_officer', 'view_reports'), ('finance_officer', 'manage_orders'),
+            # Inventory Manager — inventory only; no financials, orders, user mgmt
+            ('inventory_manager', 'view_dashboard'), ('inventory_manager', 'manage_inventory'),
+            # Product Manager — products + inventory view; no financials, user mgmt
+            ('product_manager', 'view_dashboard'), ('product_manager', 'manage_products'),
+            ('product_manager', 'manage_inventory'),
+            # Front Desk Officer — register customers, create orders, view order status
+            ('front_desk', 'view_dashboard'), ('front_desk', 'manage_customers'),
+            ('front_desk', 'manage_orders'),
+            # Cashier — view/update orders + payment only
             ('cashier', 'view_dashboard'), ('cashier', 'manage_orders'),
         ]
         for role, perm in permissions:
@@ -411,10 +421,11 @@ def init_database():
                          VALUES (?, ?, ?, ?, ?, ?)""",
                       ('admin', admin_pw, 'admin@nbn.com', 'System Administrator', 'admin', 1))
             sample_users = [
-                ('finance_manager',    hash_password('finance123'),    'finance@nbn.com',    'Finance Manager',    'financial', 1),
-                ('production_manager', hash_password('production123'), 'production@nbn.com', 'Production Manager', 'production', 1),
-                ('sales_manager',      hash_password('sales123'),      'sales@nbn.com',      'Sales Manager',      'sales', 1),
-                ('cashier_user',       hash_password('cashier123'),    'cashier@nbn.com',    'Cashier',            'cashier', 1),
+                ('finance_officer',    hash_password('finance123'),    'finance@nbn.com',    'Finance Officer',      'finance_officer',   1),
+                ('inventory_mgr',      hash_password('inventory123'),  'inventory@nbn.com',  'Inventory Manager',    'inventory_manager', 1),
+                ('product_mgr',        hash_password('product123'),    'product@nbn.com',    'Product Manager',      'product_manager',   1),
+                ('front_desk_user',    hash_password('frontdesk123'),  'frontdesk@nbn.com',  'Front Desk Officer',   'front_desk',        1),
+                ('cashier_user',       hash_password('cashier123'),    'cashier@nbn.com',    'Cashier',              'cashier',           1),
             ]
             for u in sample_users:
                 c.execute("INSERT OR IGNORE INTO users (username, password, email, full_name, role, is_active) VALUES (?, ?, ?, ?, ?, ?)", u)
@@ -440,15 +451,6 @@ def init_database():
             ]
             for cust in customers:
                 c.execute("INSERT INTO customers (customer_code, name, email, phone, address, city, customer_type, status, total_spent) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", cust)
-
-            machines = [
-                ('Tissue Line A',  'Tissue',    'running',     'T-0424', '120 units/min', 94, '2026-04-01', '2026-04-15'),
-                ('Roofing Line B', 'Roofing',   'running',     'R-0425', '45 units/min',  88, '2026-04-02', '2026-04-16'),
-                ('Tissue Line C',  'Tissue',    'maintenance', None,     '110 units/min', 76, '2026-03-20', '2026-04-05'),
-                ('Packaging Line', 'Packaging', 'idle',        None,     '60 units/min',  92, '2026-04-03', '2026-04-17'),
-            ]
-            for m in machines:
-                c.execute("INSERT INTO machines (name, type, status, current_batch, speed, efficiency, last_maintenance, next_maintenance) VALUES (?, ?, ?, ?, ?, ?, ?, ?)", m)
 
             financials = [
                 ('revenue', 'Sales',        145000, 'Monthly tissue sales',  '2026-03-31', 'REV-001', None),
@@ -552,8 +554,6 @@ _ALL_TABLES = [
     'inventory_transactions',
     'orders',
     'order_items',
-    'machines',
-    'production_records',
     'financial_transactions',
 ]
 
@@ -1204,50 +1204,6 @@ def deactivate_raw_material(material_id, user_id):
         return False
 
 
-    try:
-        with get_db() as conn:
-            df = pd.read_sql_query(
-                """SELECT pr.id, p.name AS product_name, pr.batch_number, pr.shift, pr.operator,
-                          pr.quantity, pr.produced_date, pr.status, pr.quality_score
-                   FROM production_records pr
-                   LEFT JOIN products p ON pr.product_id = p.id
-                   ORDER BY pr.produced_date DESC""",
-                conn
-            )
-        return df
-    except Exception as e:
-        print(f"Get production records error: {e}")
-        return pd.DataFrame()
-
-def add_production_record(product_id, batch_number, shift, operator, quantity, produced_date, quality_score, notes, user_id):
-    try:
-        with get_db() as conn:
-            conn.execute(
-                """INSERT INTO production_records (product_id, batch_number, shift, operator, quantity, produced_date, quality_score, notes, recorded_by)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (product_id, batch_number, shift, operator, float(quantity), str(produced_date), float(quality_score), notes, user_id)
-            )
-            conn.execute(
-                "UPDATE products SET stock_quantity = stock_quantity + ? WHERE id = ?",
-                (int(quantity), product_id)
-            )
-            conn.execute(
-                "INSERT INTO inventory_transactions (product_id, transaction_type, quantity, reason) VALUES (?, 'production', ?, ?)",
-                (product_id, int(quantity), f"Batch {batch_number}")
-            )
-        log_activity(user_id, "add_production", f"Added production batch {batch_number}")
-        return True
-    except Exception as e:
-        print(f"Add production error: {e}")
-        return False
-
-def get_machines():
-    try:
-        with get_db() as conn:
-            df = pd.read_sql_query("SELECT * FROM machines ORDER BY name", conn)
-        return df
-    except Exception:
-        return pd.DataFrame()
 
 def get_real_revenue(period='all'):
     try:
@@ -1512,24 +1468,6 @@ def show_dashboard():
         else:
             st.info("You don't have permission to view orders")
 
-    st.subheader("📈 Production Trend (Last 7 Days)")
-    try:
-        with get_db() as conn:
-            prod_data = pd.read_sql_query(
-                """SELECT produced_date, SUM(quantity) AS total
-                   FROM production_records
-                   WHERE produced_date >= date('now', '-7 days')
-                   GROUP BY produced_date ORDER BY produced_date""",
-                conn
-            )
-        if not prod_data.empty:
-            fig = px.line(prod_data, x='produced_date', y='total', markers=True, color_discrete_sequence=['#b91c1c'])
-            fig.update_layout(height=400)
-            st.plotly_chart(fig, use_container_width=True)
-        else:
-            st.info("No production data available for the last 7 days")
-    except Exception:
-        st.info("Unable to load production chart.")
 
 
 def show_products():
@@ -1983,7 +1921,7 @@ def show_orders():
     render_toast()
 
     user_role = st.session_state.user['role']
-    is_cashier = user_role in ('cashier', 'admin', 'manager', 'financial')
+    is_cashier = user_role in ('cashier', 'admin', 'manager', 'finance_officer')
 
     tab_labels = ["📋 Orders List"]
     if user_role not in ('cashier',):
@@ -1991,7 +1929,6 @@ def show_orders():
     if is_cashier:
         tab_labels.append("💳 Update Payment")
     tab_labels.append("📤 Export")
-
     tabs = st.tabs(tab_labels)
     tab_idx = 0
 
@@ -2192,138 +2129,6 @@ def show_orders():
 
 
 
-def show_production():
-    if not has_permission(st.session_state.user['id'], 'manage_production'):
-        st.error("❌ You don't have permission to access this page")
-        return
-
-    st.title("🏭 Production Management")
-    render_toast()
-
-    # Machine status panel — plain render (st.fragment requires Streamlit ≥1.37)
-    machines_df = get_machines()
-    header_col, meta_col = st.columns([3, 1])
-    with header_col:
-        st.subheader("🔧 Machine Status")
-    with meta_col:
-        st.caption(f"🔄 Last updated: {datetime.now().strftime('%H:%M:%S')}")
-
-    if not machines_df.empty:
-        status_colors = {"running": "#16a34a", "maintenance": "#d97706", "idle": "#6b7280"}
-        status_icons  = {"running": "🟢",       "maintenance": "🟡",       "idle": "⚪"}
-        cols = st.columns(4)
-        for idx, (_, machine) in enumerate(machines_df.iterrows()):
-            status = str(machine['status']).lower()
-            icon   = status_icons.get(status, "⚪")
-            color  = status_colors.get(status, "#6b7280")
-            eff    = float(machine['efficiency'])
-            batch  = machine['current_batch'] if machine['current_batch'] else "—"
-            speed  = machine['speed']         if machine['speed']         else "—"
-            with cols[idx % 4]:
-                st.markdown(f"""
-                <div style='background:white;padding:1rem;border-radius:0.5rem;
-                            margin-bottom:0.5rem;border-left:4px solid {color};
-                            box-shadow:0 1px 3px rgba(0,0,0,0.08);'>
-                    <h4 style='margin:0 0 0.4rem 0;font-size:1rem;'>{icon} {machine['name']}</h4>
-                    <span style='display:inline-block;padding:0.15rem 0.5rem;border-radius:999px;
-                                 font-size:0.7rem;font-weight:600;background:{color}22;color:{color};
-                                 margin-bottom:0.5rem;'>{status.upper()}</span><br>
-                    <small><b>Efficiency:</b> {eff:.1f}%</small><br>
-                    <div class='progress-bar' style='margin:0.3rem 0 0.4rem;'>
-                        <div class='progress-fill' style='width:{eff}%;background:{color};'></div>
-                    </div>
-                    <small><b>Batch:</b> {batch}</small><br>
-                    <small><b>Speed:</b> {speed}</small>
-                </div>
-                """, unsafe_allow_html=True)
-    else:
-        st.info("No machines found.")
-
-    st.markdown("---")
-    tab1, tab2, tab3 = st.tabs(["📋 Production Records", "➕ Record Production", "📤 Export"])
-
-    with tab1:
-        with st.spinner("Loading records..."):
-            prod_df = get_production_records()
-        if not prod_df.empty:
-            page_size = 20
-            total_pages = max(1, -(-len(prod_df) // page_size))
-            page_num = st.number_input("Page", min_value=1, max_value=total_pages, value=1, step=1, key="prod_page")
-            start = (page_num - 1) * page_size
-            st.dataframe(prod_df.iloc[start:start+page_size], use_container_width=True, hide_index=True)
-
-            st.subheader("📊 Production Summary")
-            col1, col2, col3, col4 = st.columns(4)
-            with col1:
-                st.metric("Total Production", f"{prod_df['quantity'].sum():,.1f} units")
-            with col2:
-                avg_q = prod_df['quality_score'].mean()
-                st.metric("Avg Quality Score", f"{avg_q:.1f}%")
-            with col3:
-                day_shift = prod_df[prod_df['shift'] == 'Day']['quantity'].sum()
-                st.metric("Day Shift Total", f"{day_shift:,.1f}")
-            with col4:
-                night_shift = prod_df[prod_df['shift'] == 'Night']['quantity'].sum()
-                st.metric("Night Shift Total", f"{night_shift:,.1f}")
-        else:
-            st.info("No production records found")
-
-    with tab2:
-        products_df = get_products()
-        if not products_df.empty:
-            with st.form("record_production_form", clear_on_submit=True):
-                st.subheader("Record New Production Batch")
-                col1, col2 = st.columns(2)
-                with col1:
-                    product_options = {row['name']: row['id'] for _, row in products_df.iterrows()}
-                    selected_product = st.selectbox("Product *", list(product_options.keys()))
-                    prod_prefix = products_df[products_df['name'] == selected_product]['sku'].iloc[0].split('-')[0]
-                    batch_number = st.text_input("Batch Number *", placeholder=f"e.g., {prod_prefix}-{datetime.now().strftime('%y%m%d')}-001")
-                    shift    = st.selectbox("Shift *", ["Day", "Night"])
-                    quantity = st.number_input("Quantity Produced *", min_value=0.0, step=0.1, format="%.1f")
-                with col2:
-                    operator      = st.selectbox("Operator *", ["John Mensah", "Kwame Asante", "Abena Osei", "Yaw Amponsah"])
-                    produced_date = st.date_input("Production Date *", datetime.now())
-                    quality_score = st.slider("Quality Score (%) *", 0, 100, 95)
-                    notes         = st.text_area("Notes", placeholder="Add any additional notes...")
-
-                if st.form_submit_button("✅ Record Production", use_container_width=True):
-                    errors = []
-                    if not batch_number.strip():
-                        errors.append("Batch number is required")
-                    if quantity <= 0:
-                        errors.append("Quantity must be greater than zero")
-                    if errors:
-                        for e in errors:
-                            st.warning(e)
-                    else:
-                        product_id = product_options[selected_product]
-                        with st.spinner("Recording..."):
-                            ok = add_production_record(product_id, batch_number, shift, operator, quantity, produced_date, quality_score, notes, st.session_state.user['id'])
-                        if ok:
-                            show_toast(f"Production batch {batch_number} recorded!")
-                            st.balloons()
-                            st.rerun()
-                        else:
-                            st.error("Failed to record production. Please try again.")
-        else:
-            st.error("❌ No products available! Please add products before recording production.")
-
-    with tab3:
-        prod_df = get_production_records()
-        if not prod_df.empty:
-            col1, col2 = st.columns(2)
-            with col1:
-                st.download_button("⬇️ Download CSV", data=export_dataframe_to_csv(prod_df),
-                                   file_name="production.csv", mime="text/csv", use_container_width=True)
-            with col2:
-                try:
-                    st.download_button("⬇️ Download Excel", data=export_dataframe_to_excel(prod_df),
-                                       file_name="production.xlsx",
-                                       mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                                       use_container_width=True)
-                except Exception:
-                    pass
 
 
 def show_financials():
@@ -2446,7 +2251,7 @@ def show_reports():
     st.title("📈 Reports & Analytics")
     render_toast()
 
-    report_type = st.selectbox("Select Report", ["📊 Inventory Report", "📈 Sales Report", "🏭 Production Report"])
+    report_type = st.selectbox("Select Report", ["📊 Inventory Report", "📈 Sales Report"])
 
     if report_type == "📊 Inventory Report":
         st.subheader("Inventory Status Report")
@@ -2509,37 +2314,14 @@ def show_reports():
         else:
             st.info("No sales data available")
 
-    elif report_type == "🏭 Production Report":
-        st.subheader("Production Report")
-        with st.spinner("Loading..."):
-            prod_df = get_production_records()
-        if not prod_df.empty:
-            by_product = prod_df.groupby('product_name')['quantity'].sum().reset_index()
-            fig = px.bar(by_product, x='product_name', y='quantity', title='Production by Product',
-                         color='product_name', color_discrete_sequence=['#b91c1c', '#fbbf24'])
-            st.plotly_chart(fig, use_container_width=True)
-
-            st.subheader("Quality Analysis")
-            col1, col2 = st.columns(2)
-            with col1:
-                st.metric("Average Quality Score", f"{prod_df['quality_score'].mean():.1f}%")
-            with col2:
-                st.metric("Batches with 90%+ Quality", len(prod_df[prod_df['quality_score'] >= 90]))
-
-            st.subheader("Production Records")
-            st.dataframe(prod_df, use_container_width=True, hide_index=True)
-
-            st.subheader("📤 Export")
-            st.download_button("⬇️ Download CSV", data=export_dataframe_to_csv(prod_df),
-                               file_name="production_report.csv", mime="text/csv")
-        else:
-            st.info("No production data available")
-
 
 def show_user_management():
-    if st.session_state.user['role'] != 'admin':
-        st.error("❌ Only administrators can access this page")
+    user_role = st.session_state.user['role']
+    if user_role not in ('admin', 'manager'):
+        st.error("❌ Only administrators and managers can access this page")
         return
+
+    is_admin = user_role == 'admin'
 
     st.title("👥 User Management")
     render_toast()
@@ -2575,7 +2357,9 @@ def show_user_management():
                     else:
                         st.warning("Please enter a new password")
             with col2:
-                if user_data['role'] != 'admin':
+                # Manager cannot delete admin users; admin cannot delete themselves via this btn
+                can_delete = user_data['role'] != 'admin' if is_admin else (user_data['role'] not in ('admin', 'manager'))
+                if can_delete:
                     if st.button("Delete User", use_container_width=True, type="secondary"):
                         if delete_user(uid, st.session_state.user['id']):
                             show_toast(f"User {user_data['username']} deleted")
@@ -2583,15 +2367,25 @@ def show_user_management():
                         else:
                             st.error("Failed to delete user.")
             with col3:
-                roles = ["admin", "manager", "financial", "production", "sales", "cashier"]
-                new_role = st.selectbox("Change Role", roles, index=roles.index(user_data['role']) if user_data['role'] in roles else 0)
+                # Admin can assign any role; manager cannot assign admin
+                if is_admin:
+                    roles = ["admin", "manager", "finance_officer", "inventory_manager", "product_manager", "front_desk", "cashier"]
+                else:
+                    roles = ["manager", "finance_officer", "inventory_manager", "product_manager", "front_desk", "cashier"]
+                cur_role = user_data['role'] if user_data['role'] in roles else roles[0]
+                new_role = st.selectbox("Change Role", roles, index=roles.index(cur_role))
                 new_status = st.checkbox("Active", value=user_data['is_active'] == 1)
-                if st.button("Update Role/Status", use_container_width=True):
-                    if update_user(uid, user_data['email'], user_data['full_name'], new_role, 1 if new_status else 0, st.session_state.user['id']):
-                        show_toast(f"User {user_data['username']} updated!")
-                        st.rerun()
-                    else:
-                        st.error("Failed to update user.")
+                # Manager cannot modify admin accounts
+                can_update = True if is_admin else user_data['role'] != 'admin'
+                if can_update:
+                    if st.button("Update Role/Status", use_container_width=True):
+                        if update_user(uid, user_data['email'], user_data['full_name'], new_role, 1 if new_status else 0, st.session_state.user['id']):
+                            show_toast(f"User {user_data['username']} updated!")
+                            st.rerun()
+                        else:
+                            st.error("Failed to update user.")
+                else:
+                    st.info("Managers cannot modify Admin accounts.")
 
     with tab2:
         with st.form("add_user_form", clear_on_submit=True):
@@ -2602,7 +2396,11 @@ def show_user_management():
                 email     = st.text_input("Email *")
                 full_name = st.text_input("Full Name *")
             with col2:
-                role             = st.selectbox("Role *", ["admin", "manager", "financial", "production", "sales", "cashier"])
+                if is_admin:
+                    role_choices = ["admin", "manager", "finance_officer", "inventory_manager", "product_manager", "front_desk", "cashier"]
+                else:
+                    role_choices = ["manager", "finance_officer", "inventory_manager", "product_manager", "front_desk", "cashier"]
+                role             = st.selectbox("Role *", role_choices)
                 password         = st.text_input("Password *", type="password")
                 confirm_password = st.text_input("Confirm Password *", type="password")
 
@@ -2644,21 +2442,24 @@ def show_user_management():
                         st.error("An error occurred while creating the user. Please try again.")
 
     with tab3:
-        st.subheader("User Activity Log")
-        with st.spinner("Loading activity log..."):
-            activity_df = get_user_activity_log(200)
-        if not activity_df.empty:
-            page_size = 50
-            total_pages = max(1, -(-len(activity_df) // page_size))
-            page_num = st.number_input("Page", min_value=1, max_value=total_pages, value=1, step=1, key="act_page")
-            start = (page_num - 1) * page_size
-            st.caption(f"Showing {start+1}–{min(start+page_size, len(activity_df))} of {len(activity_df)} entries")
-            st.dataframe(activity_df.iloc[start:start+page_size], use_container_width=True, hide_index=True)
-
-            st.download_button("⬇️ Export Activity Log", data=export_dataframe_to_csv(activity_df),
-                               file_name="activity_log.csv", mime="text/csv")
+        if not is_admin:
+            st.info("Activity logs are only accessible to administrators.")
         else:
-            st.info("No activity logs available")
+            st.subheader("User Activity Log")
+            with st.spinner("Loading activity log..."):
+                activity_df = get_user_activity_log(200)
+            if not activity_df.empty:
+                page_size = 50
+                total_pages = max(1, -(-len(activity_df) // page_size))
+                page_num = st.number_input("Page", min_value=1, max_value=total_pages, value=1, step=1, key="act_page")
+                start = (page_num - 1) * page_size
+                st.caption(f"Showing {start+1}–{min(start+page_size, len(activity_df))} of {len(activity_df)} entries")
+                st.dataframe(activity_df.iloc[start:start+page_size], use_container_width=True, hide_index=True)
+
+                st.download_button("⬇️ Export Activity Log", data=export_dataframe_to_csv(activity_df),
+                                   file_name="activity_log.csv", mime="text/csv")
+            else:
+                st.info("No activity logs available")
 
 
 def show_system_settings():
@@ -2873,7 +2674,6 @@ def main():
                 ('manage_inventory',  "Inventory",       "archive"),
                 ('manage_customers',  "Customers",       "people"),
                 ('manage_orders',     "Orders",          "cart"),
-                ('manage_production', "Production",      "gear"),
                 ('manage_financials', "Financials",      "coin"),
                 ('view_reports',      "Reports",         "graph-up"),
             ]
@@ -2882,9 +2682,12 @@ def main():
                     menu_options.append(label)
                     menu_icons.append(icon)
 
+            if st.session_state.user['role'] in ('admin', 'manager'):
+                menu_options.append("User Management")
+                menu_icons.append("people-fill")
             if st.session_state.user['role'] == 'admin':
-                menu_options += ["User Management", "Settings"]
-                menu_icons   += ["people-fill", "gear-fill"]
+                menu_options += ["Settings"]
+                menu_icons   += ["gear-fill"]
 
             menu_options.append("Logout")
             menu_icons.append("box-arrow-right")
@@ -2923,7 +2726,6 @@ def main():
             "Inventory":       show_inventory,
             "Customers":       show_customers,
             "Orders":          show_orders,
-            "Production":      show_production,
             "Financials":      show_financials,
             "Reports":         show_reports,
             "User Management": show_user_management,

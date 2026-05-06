@@ -217,7 +217,7 @@ def export_to_csv(table_name, filename):
     """
     ALLOWED_TABLES = {
         'products', 'customers', 'orders', 'order_items',
-        'financial_transactions', 'production_records',
+        'financial_transactions', 'raw_materials',
         'machines', 'users', 'user_activity'
     }
     if table_name not in ALLOWED_TABLES:
