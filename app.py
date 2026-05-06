@@ -191,9 +191,9 @@ def init_database():
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             username TEXT UNIQUE NOT NULL,
             password TEXT NOT NULL,
-            email TEXT NOT NULL,
+            email TEXT UNIQUE NOT NULL,
             full_name TEXT NOT NULL,
-            role TEXT DEFAULT 'viewer',
+            role TEXT DEFAULT 'sales',
             is_active BOOLEAN DEFAULT 1,
             last_login TIMESTAMP,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -238,8 +238,27 @@ def init_database():
             min_stock INTEGER DEFAULT 0,
             unit TEXT DEFAULT 'units',
             description TEXT,
+            is_active BOOLEAN DEFAULT 1,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_by INTEGER,
+            FOREIGN KEY (updated_by) REFERENCES users (id)
+        )''')
+
+        c.execute('''CREATE TABLE IF NOT EXISTS raw_materials (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            sku TEXT UNIQUE NOT NULL,
+            name TEXT NOT NULL,
+            category TEXT DEFAULT 'Raw Material',
+            warehouse_location TEXT DEFAULT 'Warehouse A',
+            quantity_on_hand REAL DEFAULT 0,
+            min_stock_level REAL DEFAULT 0,
+            unit_of_measure TEXT DEFAULT 'units',
+            is_active BOOLEAN DEFAULT 1,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_by INTEGER,
+            FOREIGN KEY (updated_by) REFERENCES users (id)
         )''')
 
         c.execute('''CREATE TABLE IF NOT EXISTS inventory_transactions (
@@ -274,14 +293,18 @@ def init_database():
             order_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             status TEXT DEFAULT 'pending',
             payment_method TEXT,
-            payment_status TEXT DEFAULT 'pending',
+            payment_status TEXT DEFAULT 'unpaid',
+            delivery_method TEXT DEFAULT 'pickup',
             subtotal REAL DEFAULT 0,
             tax REAL DEFAULT 0,
             total REAL DEFAULT 0,
             notes TEXT,
             created_by INTEGER,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_by INTEGER,
             FOREIGN KEY (customer_id) REFERENCES customers (id),
-            FOREIGN KEY (created_by) REFERENCES users (id)
+            FOREIGN KEY (created_by) REFERENCES users (id),
+            FOREIGN KEY (updated_by) REFERENCES users (id)
         )''')
 
         c.execute('''CREATE TABLE IF NOT EXISTS order_items (
@@ -348,6 +371,7 @@ def init_database():
         c.execute("CREATE INDEX IF NOT EXISTS idx_ft_type_date ON financial_transactions(transaction_type, transaction_date)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_user_activity_user ON user_activity(user_id)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_inventory_tx_product ON inventory_transactions(product_id)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_raw_materials_sku ON raw_materials(sku)")
 
         # Permissions
         permissions = [
@@ -359,9 +383,10 @@ def init_database():
             ('manager', 'manage_customers'), ('manager', 'manage_orders'), ('manager', 'manage_production'),
             ('manager', 'view_reports'),
             ('financial', 'view_dashboard'), ('financial', 'manage_financials'), ('financial', 'view_reports'),
+            ('financial', 'manage_orders'),
             ('production', 'view_dashboard'), ('production', 'manage_production'), ('production', 'view_reports'),
             ('sales', 'view_dashboard'), ('sales', 'manage_customers'), ('sales', 'manage_orders'),
-            ('viewer', 'view_dashboard')
+            ('cashier', 'view_dashboard'), ('cashier', 'manage_orders'),
         ]
         for role, perm in permissions:
             c.execute("INSERT OR IGNORE INTO role_permissions (role, permission) VALUES (?, ?)", (role, perm))
@@ -389,7 +414,7 @@ def init_database():
                 ('finance_manager',    hash_password('finance123'),    'finance@nbn.com',    'Finance Manager',    'financial', 1),
                 ('production_manager', hash_password('production123'), 'production@nbn.com', 'Production Manager', 'production', 1),
                 ('sales_manager',      hash_password('sales123'),      'sales@nbn.com',      'Sales Manager',      'sales', 1),
-                ('viewer_user',        hash_password('viewer123'),     'viewer@nbn.com',     'Viewer User',        'viewer', 1),
+                ('cashier_user',       hash_password('cashier123'),    'cashier@nbn.com',    'Cashier',            'cashier', 1),
             ]
             for u in sample_users:
                 c.execute("INSERT OR IGNORE INTO users (username, password, email, full_name, role, is_active) VALUES (?, ?, ?, ?, ?, ?)", u)
@@ -523,6 +548,7 @@ _ALL_TABLES = [
     'user_activity',
     'customers',
     'products',
+    'raw_materials',
     'inventory_transactions',
     'orders',
     'order_items',
@@ -774,18 +800,25 @@ def get_all_users():
 def add_user(username, password, email, full_name, role, created_by):
     try:
         with get_db() as conn:
+            # Explicit duplicate checks for clearer error messages
+            dup_username = conn.execute("SELECT id FROM users WHERE username = ?", (username.strip(),)).fetchone()
+            if dup_username:
+                return False, None, "username_taken"
+            dup_email = conn.execute("SELECT id FROM users WHERE email = ?", (email.strip().lower(),)).fetchone()
+            if dup_email:
+                return False, None, "email_taken"
             conn.execute(
                 "INSERT INTO users (username, password, email, full_name, role, is_active, created_by) VALUES (?, ?, ?, ?, ?, 1, ?)",
-                (username.strip(), hash_password(password), email.strip(), full_name.strip(), role, created_by)
+                (username.strip(), hash_password(password), email.strip().lower(), full_name.strip(), role, created_by)
             )
             user_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
         log_activity(created_by, "create_user", f"Created user {username} with role {role}")
-        return True, user_id
+        return True, user_id, None
     except sqlite3.IntegrityError:
-        return False, None
+        return False, None, "duplicate"
     except Exception as e:
         print(f"Add user error: {e}")
-        return False, None
+        return False, None, str(e)
 
 def update_user(user_id, email, full_name, role, is_active, admin_id):
     try:
@@ -881,15 +914,21 @@ def generate_customer_code():
 
 def get_products(search=None, category=None):
     try:
-        query = "SELECT id, sku, name, category, price, cost, stock_quantity, min_stock, unit FROM products WHERE 1=1"
+        query = """SELECT p.sku, p.name, p.category, p.price, p.cost, p.stock_quantity, p.min_stock,
+                          p.unit, p.updated_at,
+                          u.full_name AS updated_by,
+                          p.id AS _id
+                   FROM products p
+                   LEFT JOIN users u ON p.updated_by = u.id
+                   WHERE p.is_active = 1"""
         params = []
         if search:
-            query += " AND (name LIKE ? OR sku LIKE ?)"
+            query += " AND (p.name LIKE ? OR p.sku LIKE ?)"
             params.extend([f'%{search}%', f'%{search}%'])
         if category and category != "All Categories":
-            query += " AND category = ?"
+            query += " AND p.category = ?"
             params.append(category)
-        query += " ORDER BY name"
+        query += " ORDER BY p.name"
         with get_db() as conn:
             df = pd.read_sql_query(query, conn, params=params)
         return df
@@ -917,11 +956,12 @@ def update_product(product_id, name, category, price, cost, stock, min_stock, un
         with get_db() as conn:
             conn.execute(
                 """UPDATE products SET name=?, category=?, price=?, cost=?,
-                   stock_quantity=?, min_stock=?, unit=?, description=?, updated_at=CURRENT_TIMESTAMP
+                   stock_quantity=?, min_stock=?, unit=?, description=?,
+                   updated_at=CURRENT_TIMESTAMP, updated_by=?
                    WHERE id=?""",
-                (name.strip(), category, float(price), float(cost), int(stock), int(min_stock), unit.strip(), description, product_id)
+                (name.strip(), category, float(price), float(cost), int(stock), int(min_stock), unit.strip(), description, user_id, product_id)
             )
-        log_activity(user_id, "update_product", f"Updated product ID {product_id}")
+        log_activity(user_id, "update_product", f"Updated product ID {product_id}: {name}")
         return True
     except Exception as e:
         print(f"Update product error: {e}")
@@ -993,7 +1033,7 @@ def delete_customer(customer_id, user_id):
         print(f"Delete customer error: {e}")
         return False
 
-def add_order(customer_id, items, payment_method, notes, user_id):
+def add_order(customer_id, items, payment_method, delivery_method, notes, user_id):
     """
     Creates order with stock check inside a single transaction to prevent race conditions.
     Raises ValueError if stock is insufficient.
@@ -1016,9 +1056,10 @@ def add_order(customer_id, items, payment_method, notes, user_id):
                     raise ValueError(f"Insufficient stock for product ID {item['product_id']}. Available: {available}, Requested: {item['quantity']}")
 
             conn.execute(
-                """INSERT INTO orders (order_number, customer_id, payment_method, subtotal, tax, total, notes, status, created_by)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?)""",
-                (order_number, customer_id, payment_method, subtotal, tax, total, notes, user_id)
+                """INSERT INTO orders (order_number, customer_id, payment_method, delivery_method,
+                   payment_status, subtotal, tax, total, notes, status, created_by)
+                   VALUES (?, ?, ?, ?, 'unpaid', ?, ?, ?, ?, 'pending', ?)""",
+                (order_number, customer_id, payment_method, delivery_method, subtotal, tax, total, notes, user_id)
             )
             order_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
 
@@ -1028,8 +1069,8 @@ def add_order(customer_id, items, payment_method, notes, user_id):
                     (order_id, item['product_id'], item['quantity'], item['price'], item['total'])
                 )
                 conn.execute(
-                    "UPDATE products SET stock_quantity = stock_quantity - ? WHERE id = ? AND stock_quantity >= ?",
-                    (item['quantity'], item['product_id'], item['quantity'])
+                    "UPDATE products SET stock_quantity = stock_quantity - ?, updated_at=CURRENT_TIMESTAMP, updated_by=? WHERE id = ? AND stock_quantity >= ?",
+                    (item['quantity'], user_id, item['product_id'], item['quantity'])
                 )
                 # Log inventory transaction
                 conn.execute(
@@ -1055,10 +1096,25 @@ def add_order(customer_id, items, payment_method, notes, user_id):
         print(f"Add order error: {e}")
         raise
 
+def update_order_payment(order_id, payment_method, payment_status, user_id):
+    """Cashier-only function to update payment method and payment status."""
+    try:
+        with get_db() as conn:
+            conn.execute(
+                """UPDATE orders SET payment_method=?, payment_status=?,
+                   updated_at=CURRENT_TIMESTAMP, updated_by=? WHERE id=?""",
+                (payment_method, payment_status, user_id, order_id)
+            )
+        log_activity(user_id, "update_payment", f"Updated payment for order ID {order_id}: {payment_status}")
+        return True
+    except Exception as e:
+        print(f"Update order payment error: {e}")
+        return False
+
 def get_orders(search=None, status=None):
     try:
         query = """SELECT o.id, o.order_number, c.name AS customer_name, o.order_date, o.status,
-                          o.payment_method, o.payment_status, o.total
+                          o.payment_method, o.payment_status, o.delivery_method, o.total
                    FROM orders o
                    LEFT JOIN customers c ON o.customer_id = c.id
                    WHERE 1=1"""
@@ -1077,7 +1133,77 @@ def get_orders(search=None, status=None):
         print(f"Get orders error: {e}")
         return pd.DataFrame()
 
-def get_production_records():
+def get_raw_materials(search=None, location=None):
+    try:
+        query = """SELECT id, sku, name, category, warehouse_location, quantity_on_hand,
+                          min_stock_level, unit_of_measure,
+                          CASE WHEN quantity_on_hand <= 0 THEN 'Out of Stock'
+                               WHEN quantity_on_hand <= min_stock_level * 0.5 THEN '🔴 Critical'
+                               WHEN quantity_on_hand <= min_stock_level THEN '🟡 Low Stock'
+                               ELSE '🟢 In Stock' END AS stock_status
+                   FROM raw_materials WHERE is_active = 1"""
+        params = []
+        if search:
+            query += " AND (name LIKE ? OR sku LIKE ?)"
+            params.extend([f'%{search}%', f'%{search}%'])
+        if location and location != "All Locations":
+            query += " AND warehouse_location = ?"
+            params.append(location)
+        query += " ORDER BY name"
+        with get_db() as conn:
+            df = pd.read_sql_query(query, conn, params=params)
+        return df
+    except Exception as e:
+        print(f"Get raw materials error: {e}")
+        return pd.DataFrame()
+
+def add_raw_material(name, category, location, qty, min_qty, unit, user_id):
+    try:
+        prefix_map = {'Raw Material': 'RM', 'Packaging': 'PKG'}
+        prefix = prefix_map.get(category, 'RM')
+        with get_db() as conn:
+            rows = conn.execute("SELECT sku FROM raw_materials WHERE sku LIKE ?", (f'{prefix}-%',)).fetchall()
+            numbers = [int(r[0].split('-')[1]) for r in rows if len(r[0].split('-')) >= 2 and r[0].split('-')[1].isdigit()]
+            next_num = (max(numbers) + 1) if numbers else 1
+            sku = f"{prefix}-{next_num:03d}"
+            conn.execute(
+                """INSERT INTO raw_materials (sku, name, category, warehouse_location, quantity_on_hand,
+                   min_stock_level, unit_of_measure, updated_by)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (sku, name.strip(), category, location, float(qty), float(min_qty), unit.strip(), user_id)
+            )
+        log_activity(user_id, "add_raw_material", f"Added raw material {name} SKU {sku}")
+        return True, sku
+    except Exception as e:
+        print(f"Add raw material error: {e}")
+        return False, None
+
+def update_raw_material(material_id, name, category, location, qty, min_qty, unit, user_id):
+    try:
+        with get_db() as conn:
+            conn.execute(
+                """UPDATE raw_materials SET name=?, category=?, warehouse_location=?,
+                   quantity_on_hand=?, min_stock_level=?, unit_of_measure=?,
+                   updated_at=CURRENT_TIMESTAMP, updated_by=? WHERE id=?""",
+                (name.strip(), category, location, float(qty), float(min_qty), unit.strip(), user_id, material_id)
+            )
+        log_activity(user_id, "update_raw_material", f"Updated raw material ID {material_id}")
+        return True
+    except Exception as e:
+        print(f"Update raw material error: {e}")
+        return False
+
+def deactivate_raw_material(material_id, user_id):
+    try:
+        with get_db() as conn:
+            conn.execute("UPDATE raw_materials SET is_active=0 WHERE id=?", (material_id,))
+        log_activity(user_id, "deactivate_raw_material", f"Deactivated raw material ID {material_id}")
+        return True
+    except Exception as e:
+        print(f"Deactivate raw material error: {e}")
+        return False
+
+
     try:
         with get_db() as conn:
             df = pd.read_sql_query(
@@ -1434,7 +1560,8 @@ def show_products():
             page_num = st.number_input("Page", min_value=1, max_value=total_pages, value=1, step=1)
             start = (page_num - 1) * page_size
             st.caption(f"Showing {start+1}–{min(start+page_size, len(products_df))} of {len(products_df)} products")
-            st.dataframe(products_df.iloc[start:start+page_size], use_container_width=True, hide_index=True)
+            display_cols = [c for c in products_df.columns if c != '_id']
+            st.dataframe(products_df[display_cols].iloc[start:start+page_size], use_container_width=True, hide_index=True)
         else:
             st.info("No products found")
 
@@ -1483,7 +1610,7 @@ def show_products():
     with tab3:
         products_df = get_products()
         if not products_df.empty:
-            product_options = {f"{row['name']} ({row['sku']})": row['id'] for _, row in products_df.iterrows()}
+            product_options = {f"{row['name']} ({row['sku']})": row['_id'] for _, row in products_df.iterrows()}
             selected = st.selectbox("Select Product to Edit/Delete", list(product_options.keys()))
             pid = product_options[selected]
             try:
@@ -1503,6 +1630,10 @@ def show_products():
                     e_min   = st.number_input("Min Stock", value=int(p['min_stock']), step=1)
                     e_unit  = st.text_input("Unit", value=str(p['unit']))
                 e_desc = st.text_area("Description", value=str(p['description']) if p['description'] else "")
+
+                # Show audit trail
+                if p.get('updated_by') and str(p['updated_by']) not in ('None', '', 'nan'):
+                    st.info(f"🕒 Last updated: **{p['updated_at']}** by **{p['updated_by']}**")
 
                 col1, col2 = st.columns(2)
                 with col1:
@@ -1556,54 +1687,150 @@ def show_inventory():
         st.error("❌ You don't have permission to access this page")
         return
 
-    st.title("🏪 Inventory Management")
+    st.title("🏪 Inventory Management — Raw Materials")
     render_toast()
 
     try:
         with get_db() as conn:
-            total_value = conn.execute("SELECT COALESCE(SUM(stock_quantity * price), 0) FROM products").fetchone()[0]
-            low_count   = conn.execute("SELECT COUNT(*) FROM products WHERE stock_quantity <= min_stock").fetchone()[0]
+            total_items   = conn.execute("SELECT COUNT(*) FROM raw_materials WHERE is_active=1").fetchone()[0]
+            low_count     = conn.execute("SELECT COUNT(*) FROM raw_materials WHERE is_active=1 AND quantity_on_hand <= min_stock_level").fetchone()[0]
+            critical_count= conn.execute("SELECT COUNT(*) FROM raw_materials WHERE is_active=1 AND quantity_on_hand <= min_stock_level * 0.5").fetchone()[0]
     except Exception:
-        total_value, low_count = 0, 0
+        total_items = low_count = critical_count = 0
 
     col1, col2, col3 = st.columns(3)
     with col1:
-        st.metric("💰 Total Inventory Value", f"₵{total_value:,.0f}")
+        st.metric("📦 Total Raw Materials", total_items)
     with col2:
-        st.metric("⚠️ Low Stock Alerts", low_count, delta="Needs attention" if low_count > 0 else None)
+        st.metric("⚠️ Low Stock", low_count, delta="Needs reorder" if low_count > 0 else None, delta_color="inverse")
     with col3:
-        st.metric("📦 Total Products", len(get_products()))
+        st.metric("🔴 Critical Stock", critical_count, delta="Urgent!" if critical_count > 0 else None, delta_color="inverse")
 
     st.markdown("---")
-    st.subheader("📋 Current Inventory Levels")
+    tab1, tab2, tab3, tab4 = st.tabs(["📋 Materials List", "➕ Add Material", "✏️ Edit / Update Stock", "📤 Export"])
 
-    with st.spinner("Loading inventory..."):
-        products_df = get_products()
-
-    if not products_df.empty:
-        products_df['status'] = products_df.apply(
-            lambda x: '🔴 Low Stock' if x['stock_quantity'] <= x['min_stock'] else '🟢 In Stock', axis=1
-        )
-        st.dataframe(products_df, use_container_width=True, hide_index=True)
-
-        low_stock_items = products_df[products_df['status'] == '🔴 Low Stock']
-        if not low_stock_items.empty:
-            st.warning(f"⚠️ {len(low_stock_items)} items are below minimum stock level. Please reorder soon!")
-
-        st.markdown("---")
-        st.subheader("📤 Export Inventory")
+    with tab1:
         col1, col2 = st.columns(2)
         with col1:
-            st.download_button("⬇️ Download CSV", data=export_dataframe_to_csv(products_df),
-                               file_name="inventory.csv", mime="text/csv", use_container_width=True)
+            search = st.text_input("🔍 Search", placeholder="Search by name or SKU...")
         with col2:
+            loc_filter = st.selectbox("Warehouse Location", ["All Locations", "Warehouse A", "Warehouse B", "Production Floor"])
+
+        with st.spinner("Loading raw materials..."):
+            rm_df = get_raw_materials(search, loc_filter)
+
+        if not rm_df.empty:
+            # Hide id from display
+            display_cols = [c for c in rm_df.columns if c != 'id']
+            st.dataframe(rm_df[display_cols], use_container_width=True, hide_index=True)
+            low = rm_df[rm_df['stock_status'].str.contains('Low|Critical|Out', na=False)]
+            if not low.empty:
+                st.warning(f"⚠️ {len(low)} items need attention (Low Stock / Critical / Out of Stock)")
+        else:
+            st.info("No raw materials found")
+
+    with tab2:
+        with st.form("add_raw_material_form", clear_on_submit=True):
+            st.subheader("Add New Raw Material")
+            col1, col2 = st.columns(2)
+            with col1:
+                rm_name     = st.text_input("Material Name *")
+                rm_category = st.selectbox("Category *", ["Raw Material", "Packaging"])
+                rm_location = st.selectbox("Warehouse Location *", ["Warehouse A", "Warehouse B", "Production Floor"])
+            with col2:
+                rm_qty      = st.number_input("Quantity On Hand *", min_value=0.0, step=0.1, format="%.2f")
+                rm_min      = st.number_input("Minimum Stock Level *", min_value=0.0, step=0.1, format="%.2f")
+                rm_unit     = st.text_input("Unit of Measure *", value="units")
+
+            if st.form_submit_button("✅ Add Material", use_container_width=True):
+                if not rm_name.strip():
+                    st.warning("Material name is required")
+                elif not rm_unit.strip():
+                    st.warning("Unit of measure is required")
+                else:
+                    ok, sku = add_raw_material(rm_name, rm_category, rm_location, rm_qty, rm_min, rm_unit, st.session_state.user['id'])
+                    if ok:
+                        show_toast(f"Raw material added! SKU: {sku}")
+                        st.balloons()
+                        st.rerun()
+                    else:
+                        st.error("Failed to add raw material.")
+
+    with tab3:
+        rm_df = get_raw_materials()
+        if not rm_df.empty:
+            rm_options = {f"{row['name']} ({row['sku']}) — {row['warehouse_location']}": row['id'] for _, row in rm_df.iterrows()}
+            selected_rm = st.selectbox("Select Material to Edit", list(rm_options.keys()))
+            rid = rm_options[selected_rm]
             try:
-                st.download_button("⬇️ Download Excel", data=export_dataframe_to_excel(products_df),
-                                   file_name="inventory.xlsx",
-                                   mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                                   use_container_width=True)
-            except Exception:
-                pass
+                with get_db() as conn:
+                    r = pd.read_sql_query(
+                        """SELECT rm.*, u.full_name AS updated_by_name
+                           FROM raw_materials rm
+                           LEFT JOIN users u ON rm.updated_by = u.id
+                           WHERE rm.id=?""",
+                        conn, params=(rid,)
+                    ).iloc[0]
+
+                # Show last-updated info
+                if r['updated_by_name']:
+                    st.info(f"🕒 Last updated: **{r['updated_at']}** by **{r['updated_by_name']}**")
+
+                col1, col2 = st.columns(2)
+                with col1:
+                    e_name  = st.text_input("Name", value=str(r['name']))
+                    cats    = ["Raw Material", "Packaging"]
+                    e_cat   = st.selectbox("Category", cats, index=cats.index(r['category']) if r['category'] in cats else 0)
+                    locs    = ["Warehouse A", "Warehouse B", "Production Floor"]
+                    e_loc   = st.selectbox("Warehouse Location", locs, index=locs.index(r['warehouse_location']) if r['warehouse_location'] in locs else 0)
+                with col2:
+                    e_qty   = st.number_input("Quantity On Hand", value=float(r['quantity_on_hand']), step=0.1, format="%.2f")
+                    e_min   = st.number_input("Min Stock Level", value=float(r['min_stock_level']), step=0.1, format="%.2f")
+                    e_unit  = st.text_input("Unit", value=str(r['unit_of_measure']))
+
+                col1, col2 = st.columns(2)
+                with col1:
+                    if st.button("💾 Update Material", use_container_width=True):
+                        if not e_name.strip():
+                            st.warning("Name is required")
+                        else:
+                            ok = update_raw_material(rid, e_name, e_cat, e_loc, e_qty, e_min, e_unit, st.session_state.user['id'])
+                            if ok:
+                                show_toast("Raw material updated!")
+                                st.rerun()
+                            else:
+                                st.error("Failed to update.")
+                with col2:
+                    if st.button("🗑️ Deactivate Material", use_container_width=True, type="secondary"):
+                        ok = deactivate_raw_material(rid, st.session_state.user['id'])
+                        if ok:
+                            show_toast("Material deactivated.")
+                            st.rerun()
+                        else:
+                            st.error("Failed to deactivate.")
+            except Exception as e:
+                st.error(f"Error loading material: {e}")
+        else:
+            st.info("No raw materials to edit")
+
+    with tab4:
+        rm_df = get_raw_materials()
+        if not rm_df.empty:
+            col1, col2 = st.columns(2)
+            display_cols = [c for c in rm_df.columns if c != 'id']
+            with col1:
+                st.download_button("⬇️ Download CSV", data=export_dataframe_to_csv(rm_df[display_cols]),
+                                   file_name="raw_materials.csv", mime="text/csv", use_container_width=True)
+            with col2:
+                try:
+                    st.download_button("⬇️ Download Excel", data=export_dataframe_to_excel(rm_df[display_cols]),
+                                       file_name="raw_materials.xlsx",
+                                       mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                                       use_container_width=True)
+                except Exception:
+                    pass
+        else:
+            st.info("No data to export")
 
 
 def show_customers():
@@ -1755,9 +1982,21 @@ def show_orders():
     st.info("💡 Order Number is automatically generated")
     render_toast()
 
-    tab1, tab2, tab3 = st.tabs(["📋 Orders List", "🛒 Create Order", "📤 Export"])
+    user_role = st.session_state.user['role']
+    is_cashier = user_role in ('cashier', 'admin', 'manager', 'financial')
 
-    with tab1:
+    tab_labels = ["📋 Orders List"]
+    if user_role not in ('cashier',):
+        tab_labels.append("🛒 Create Order")
+    if is_cashier:
+        tab_labels.append("💳 Update Payment")
+    tab_labels.append("📤 Export")
+
+    tabs = st.tabs(tab_labels)
+    tab_idx = 0
+
+    # ── TAB 1: Orders List ──────────────────────────────────────
+    with tabs[tab_idx]:
         col1, col2 = st.columns(2)
         with col1:
             search = st.text_input("🔍 Search Orders", placeholder="Search by order number or customer...")
@@ -1771,107 +2010,178 @@ def show_orders():
             page_num = st.number_input("Page", min_value=1, max_value=total_pages, value=1, step=1, key="ord_page")
             start = (page_num - 1) * page_size
             st.caption(f"Showing {start+1}–{min(start+page_size, len(orders_df))} of {len(orders_df)} orders")
-            st.dataframe(orders_df.iloc[start:start+page_size], use_container_width=True, hide_index=True)
+            # Hide internal id column
+            display_cols = [c for c in orders_df.columns if c != 'id']
+            st.dataframe(orders_df[display_cols].iloc[start:start+page_size], use_container_width=True, hide_index=True)
         else:
             st.info("No orders found")
+    tab_idx += 1
 
-    with tab2:
-        customers_df = get_customers()
-        if not customers_df.empty:
-            cust_options = {row['name']: row['id'] for _, row in customers_df.iterrows()}
-            selected_cust = st.selectbox("Select Customer", list(cust_options.keys()))
-            cust_id = cust_options[selected_cust]
+    # ── TAB 2: Create Order (not available to cashier) ──────────
+    if user_role not in ('cashier',):
+        with tabs[tab_idx]:
+            customers_df = get_customers()
+            if not customers_df.empty:
+                cust_options = {row['name']: row['id'] for _, row in customers_df.iterrows()}
+                selected_cust = st.selectbox("Select Customer", list(cust_options.keys()))
+                cust_id = cust_options[selected_cust]
 
-            with st.spinner("Loading products..."):
-                products_df = get_products()
+                with st.spinner("Loading products..."):
+                    products_df = get_products()
 
-            if not products_df.empty:
-                col1, col2, col3 = st.columns([2, 1, 1])
-                with col1:
-                    prod_labels = [f"{row['name']} - ₵{row['price']} (Stock: {row['stock_quantity']})" for _, row in products_df.iterrows()]
-                    prod_choice = st.selectbox("Product", prod_labels)
-                with col2:
-                    qty = st.number_input("Quantity", min_value=1, value=1, step=1)
-                with col3:
-                    if st.button("➕ Add to Cart", use_container_width=True):
-                        idx = prod_labels.index(prod_choice)
-                        prod = products_df.iloc[idx]
-                        # Real-time stock validation
-                        try:
-                            with get_db() as conn:
-                                live_stock = conn.execute("SELECT stock_quantity FROM products WHERE id=?", (int(prod['id']),)).fetchone()[0]
-                        except Exception:
-                            live_stock = prod['stock_quantity']
-                        if qty <= live_stock:
-                            st.session_state.order_items.append({
-                                'product_id': int(prod['id']),
-                                'name': prod['name'],
-                                'quantity': int(qty),
-                                'price': float(prod['price']),
-                                'total': float(qty * prod['price'])
-                            })
-                            show_toast(f"Added {qty} x {prod['name']}")
-                            st.rerun()
-                        else:
-                            st.error(f"❌ Only {live_stock} units available")
-
-                if st.session_state.order_items:
-                    st.markdown("---")
-                    st.subheader("🛒 Shopping Cart")
-                    items_df = pd.DataFrame(st.session_state.order_items)
-                    st.dataframe(items_df[['name', 'quantity', 'price', 'total']], use_container_width=True, hide_index=True)
-
-                    col1, col2 = st.columns(2)
+                if not products_df.empty:
+                    col1, col2, col3 = st.columns([2, 1, 1])
                     with col1:
-                        if st.button("🗑️ Clear Cart", use_container_width=True):
-                            st.session_state.order_items = []
-                            st.rerun()
+                        prod_labels = [f"{row['name']} — ₵{row['price']} (Stock: {row['stock_quantity']})" for _, row in products_df.iterrows()]
+                        prod_choice = st.selectbox("Product", prod_labels)
+                    with col2:
+                        qty = st.number_input("Quantity", min_value=1, value=1, step=1)
+                    with col3:
+                        if st.button("➕ Add to Cart", use_container_width=True):
+                            idx = prod_labels.index(prod_choice)
+                            prod = products_df.iloc[idx]
+                            try:
+                                with get_db() as conn:
+                                    live_stock = conn.execute("SELECT stock_quantity FROM products WHERE id=?", (int(prod['_id']),)).fetchone()[0]
+                            except Exception:
+                                live_stock = prod['stock_quantity']
+                            if qty <= live_stock:
+                                st.session_state.order_items.append({
+                                    'product_id': int(prod['_id']),
+                                    'name': prod['name'],
+                                    'quantity': int(qty),
+                                    'price': float(prod['price']),
+                                    'total': float(qty * prod['price'])
+                                })
+                                show_toast(f"Added {qty} x {prod['name']}")
+                                st.rerun()
+                            else:
+                                st.error(f"❌ Only {live_stock} units available")
 
-                    subtotal = sum(i['total'] for i in st.session_state.order_items)
-                    tax = subtotal * 0.125
-                    total = subtotal + tax
+                    if st.session_state.order_items:
+                        st.markdown("---")
+                        st.subheader("🛒 Shopping Cart")
+                        items_df = pd.DataFrame(st.session_state.order_items)
+                        # Show only name, quantity, price, total (no product_id)
+                        st.dataframe(items_df[['name', 'quantity', 'price', 'total']], use_container_width=True, hide_index=True)
 
-                    st.markdown(f"""
-                    <div style='background:#f0f0f0;padding:1rem;border-radius:0.5rem;margin:1rem 0;'>
-                        <p><strong>Subtotal:</strong> ₵{subtotal:,.2f}</p>
-                        <p><strong>Tax (12.5%):</strong> ₵{tax:,.2f}</p>
-                        <p><strong>Total:</strong> <strong style='color:#b91c1c;font-size:1.2rem;'>₵{total:,.2f}</strong></p>
-                    </div>
-                    """, unsafe_allow_html=True)
+                        col1, col2 = st.columns(2)
+                        with col1:
+                            if st.button("🗑️ Clear Cart", use_container_width=True):
+                                st.session_state.order_items = []
+                                st.rerun()
 
-                    preview_order = generate_order_number()
-                    st.caption(f"📝 Order Number will be: **{preview_order}**")
+                        subtotal = sum(i['total'] for i in st.session_state.order_items)
+                        tax = subtotal * 0.125
+                        total = subtotal + tax
 
-                    payment = st.selectbox("Payment Method", ["Cash", "Mobile Money", "Bank Transfer", "Credit"])
-                    notes   = st.text_area("Order Notes")
+                        st.markdown(f"""
+                        <div style='background:#f0f0f0;padding:1rem;border-radius:0.5rem;margin:1rem 0;'>
+                            <p><strong>Subtotal:</strong> ₵{subtotal:,.2f}</p>
+                            <p><strong>Tax (12.5%):</strong> ₵{tax:,.2f}</p>
+                            <p><strong>Total:</strong> <strong style='color:#b91c1c;font-size:1.2rem;'>₵{total:,.2f}</strong></p>
+                        </div>
+                        """, unsafe_allow_html=True)
 
-                    if st.button("✅ Place Order", type="primary", use_container_width=True):
-                        try:
-                            with st.spinner("Processing order..."):
-                                order_num = add_order(cust_id, st.session_state.order_items, payment, notes, st.session_state.user['id'])
-                            show_toast(f"Order {order_num} created successfully!")
-                            st.balloons()
-                            st.session_state.order_items = []
-                            st.rerun()
-                        except ValueError as ve:
-                            st.error(f"❌ Stock error: {ve}")
-                        except Exception as e:
-                            st.error(f"❌ Failed to place order: {e}")
+                        preview_order = generate_order_number()
+                        st.caption(f"📝 Order Number will be: **{preview_order}**")
+
+                        col1, col2 = st.columns(2)
+                        with col1:
+                            payment = st.selectbox("Payment Method", ["Cash", "MTN MoMo", "Bank Transfer", "Credit"])
+                        with col2:
+                            delivery_method = st.selectbox("Delivery Method", ["Pickup", "Delivery"])
+                        notes = st.text_area("Order Notes")
+
+                        if st.button("✅ Place Order", type="primary", use_container_width=True):
+                            try:
+                                with st.spinner("Processing order..."):
+                                    order_num = add_order(cust_id, st.session_state.order_items, payment, delivery_method, notes, st.session_state.user['id'])
+                                show_toast(f"Order {order_num} created successfully!")
+                                st.balloons()
+                                st.session_state.order_items = []
+                                st.rerun()
+                            except ValueError as ve:
+                                st.error(f"❌ Stock error: {ve}")
+                            except Exception as e:
+                                st.error(f"❌ Failed to place order: {e}")
+                else:
+                    st.warning("No products available. Please add products first.")
             else:
-                st.warning("No products available. Please add products first.")
-        else:
-            st.warning("No customers available. Please add customers first.")
+                st.warning("No customers available. Please add customers first.")
+        tab_idx += 1
 
-    with tab3:
+    # ── TAB: Update Payment (cashier/admin/manager/financial) ───
+    if is_cashier:
+        with tabs[tab_idx]:
+            st.subheader("💳 Update Payment Status")
+            st.info("As cashier, you can update the payment method and payment status for pending orders.")
+            try:
+                with get_db() as conn:
+                    pending_orders = pd.read_sql_query(
+                        """SELECT o.id, o.order_number, c.name AS customer, o.total,
+                                  o.payment_method, o.payment_status, o.delivery_method, o.status
+                           FROM orders o
+                           LEFT JOIN customers c ON o.customer_id = c.id
+                           WHERE o.status NOT IN ('cancelled', 'completed')
+                           ORDER BY o.order_date DESC""",
+                        conn
+                    )
+            except Exception:
+                pending_orders = pd.DataFrame()
+
+            if not pending_orders.empty:
+                order_opts = {
+                    f"{row['order_number']} — {row['customer']} — ₵{row['total']:,.2f} [{row['payment_status'].upper()}]": row['id']
+                    for _, row in pending_orders.iterrows()
+                }
+                selected_ord = st.selectbox("Select Order", list(order_opts.keys()))
+                oid = order_opts[selected_ord]
+                ord_row = pending_orders[pending_orders['id'] == oid].iloc[0]
+
+                st.markdown(f"""
+                <div style='background:#f0f9ff;padding:1rem;border-radius:0.5rem;margin-bottom:1rem;border-left:4px solid #3b82f6;'>
+                    <strong>Order:</strong> {ord_row['order_number']}<br>
+                    <strong>Customer:</strong> {ord_row['customer']}<br>
+                    <strong>Total:</strong> ₵{ord_row['total']:,.2f}<br>
+                    <strong>Delivery:</strong> {ord_row['delivery_method']}<br>
+                    <strong>Current Payment Status:</strong> {ord_row['payment_status'].upper()}
+                </div>
+                """, unsafe_allow_html=True)
+
+                col1, col2 = st.columns(2)
+                with col1:
+                    methods = ["Cash", "MTN MoMo", "Bank Transfer", "Credit"]
+                    cur_method = ord_row['payment_method'] if ord_row['payment_method'] in methods else methods[0]
+                    new_method = st.selectbox("Payment Method", methods, index=methods.index(cur_method))
+                with col2:
+                    statuses = ["unpaid", "paid"]
+                    cur_status = ord_row['payment_status'] if ord_row['payment_status'] in statuses else "unpaid"
+                    new_status = st.selectbox("Payment Status", statuses, index=statuses.index(cur_status))
+
+                if st.button("💾 Update Payment", type="primary", use_container_width=True):
+                    ok = update_order_payment(oid, new_method, new_status, st.session_state.user['id'])
+                    if ok:
+                        show_toast(f"Payment updated for {ord_row['order_number']}!")
+                        st.rerun()
+                    else:
+                        st.error("Failed to update payment.")
+            else:
+                st.info("No active orders to update.")
+        tab_idx += 1
+
+    # ── TAB: Export ─────────────────────────────────────────────
+    with tabs[tab_idx]:
         orders_df = get_orders()
         if not orders_df.empty:
+            display_cols = [c for c in orders_df.columns if c != 'id']
             col1, col2 = st.columns(2)
             with col1:
-                st.download_button("⬇️ Download CSV", data=export_dataframe_to_csv(orders_df),
+                st.download_button("⬇️ Download CSV", data=export_dataframe_to_csv(orders_df[display_cols]),
                                    file_name="orders.csv", mime="text/csv", use_container_width=True)
             with col2:
                 try:
-                    st.download_button("⬇️ Download Excel", data=export_dataframe_to_excel(orders_df),
+                    st.download_button("⬇️ Download Excel", data=export_dataframe_to_excel(orders_df[display_cols]),
                                        file_name="orders.xlsx",
                                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                                        use_container_width=True)
@@ -1879,6 +2189,7 @@ def show_orders():
                     pass
         else:
             st.info("No orders to export")
+
 
 
 def show_production():
@@ -2272,7 +2583,7 @@ def show_user_management():
                         else:
                             st.error("Failed to delete user.")
             with col3:
-                roles = ["admin", "manager", "financial", "production", "sales", "viewer"]
+                roles = ["admin", "manager", "financial", "production", "sales", "cashier"]
                 new_role = st.selectbox("Change Role", roles, index=roles.index(user_data['role']) if user_data['role'] in roles else 0)
                 new_status = st.checkbox("Active", value=user_data['is_active'] == 1)
                 if st.button("Update Role/Status", use_container_width=True):
@@ -2291,7 +2602,7 @@ def show_user_management():
                 email     = st.text_input("Email *")
                 full_name = st.text_input("Full Name *")
             with col2:
-                role             = st.selectbox("Role *", ["admin", "manager", "financial", "production", "sales", "viewer"])
+                role             = st.selectbox("Role *", ["admin", "manager", "financial", "production", "sales", "cashier"])
                 password         = st.text_input("Password *", type="password")
                 confirm_password = st.text_input("Confirm Password *", type="password")
 
@@ -2320,13 +2631,17 @@ def show_user_management():
                         st.warning(e)
                 else:
                     with st.spinner("Creating user..."):
-                        success, _ = add_user(username, password, email, full_name, role, st.session_state.user['id'])
+                        success, _, err_code = add_user(username, password, email, full_name, role, st.session_state.user['id'])
                     if success:
                         show_toast(f"User {username} created successfully!")
                         st.balloons()
                         st.rerun()
+                    elif err_code == "username_taken":
+                        st.error(f"❌ Username '{username}' is already taken. Please choose a different username.")
+                    elif err_code == "email_taken":
+                        st.error(f"❌ Email '{email}' is already registered. Each user must have a unique email.")
                     else:
-                        st.error("Username already exists or an error occurred.")
+                        st.error("An error occurred while creating the user. Please try again.")
 
     with tab3:
         st.subheader("User Activity Log")
